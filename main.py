@@ -4,7 +4,6 @@ import subprocess
 from typing import TypedDict, Annotated, Literal
 
 from dotenv import load_dotenv
-from langchain_core import documents
 from pydantic import BaseModel, Field
 
 from langchain.chat_models import init_chat_model
@@ -14,6 +13,7 @@ from langchain_openai import OpenAIEmbeddings
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
 
 load_dotenv()
 
@@ -50,6 +50,8 @@ class State(TypedDict):
     messages: Annotated[list, add_messages]
     message_intent: str | None # passing node to node
 
+    next_node: str | None
+
 def classify_intent(state: State):
     structured_llm = llm.with_structured_output(IntentClassifier)
 
@@ -65,6 +67,22 @@ def classify_intent(state: State):
     ])
 
     return  {'message_intent': result.message_intent}
+
+def accept_coding(state: State):
+    user_prompt = state['messages'][-1].content
+    decision = interrupt(f'About to run Claude Code with request:\n\n{user_prompt}\n\nApprove? (yes/no, or type a revised request)')
+
+    text = str(decision).strip().lower()
+
+    if text in ['y', 'yes', 'approve', 'ok']:
+        return  {'next_node': 'coding_agent'}
+    if text in ['n','deny', 'cancel']:
+        return  {'messages':
+                     [{'role': 'assistant', 'content': 'Coding request was denied by the user.'}],
+                     'next_node':'denied'
+                }
+
+    return  {'messages': [{'role':'user', 'content': text}], 'next_node': 'accept_coding'}
 
 def prompt_llm_chat(state: State):
     messages = [
@@ -97,19 +115,45 @@ def prompt_llm_rag(state: State):
 def prompt_llm_code(state: State):
     user_prompt = state['messages'][-1].content
 
-    workspace = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'workspace')
+    workspace = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        'workspace'
+    )
+
+    claude_path = r'C:\Users\PC\.local\bin\claude.exe'
 
     result = subprocess.run(
-        ['claude', '-p', user_prompt, '--permission-mode', 'acceptEdits'],
-        cwd = workspace,
-        capture_output= True,
-        text = True
+        [
+            claude_path,
+            '-p',
+            user_prompt,
+            '--permission-mode',
+            'acceptEdits'
+        ],
+        cwd=workspace,
+        capture_output=True,
+        text=True
     )
 
     output = result.stdout.strip() or result.stderr.strip()
 
-    return {'messages': [{'role': 'assistant', 'content': output}]}
+    return {
+        'messages': [
+            {'role': 'assistant', 'content': output}
+        ]
+    }
 
+def prepare_coding_request(state: State):
+    messages = [
+        {
+            'role': 'system',
+            'content': 'Rewrite the latest user coding request into a clear instruction for Claude Code. Use the conversation history as context. Only output the instruction, no explanation.'
+        }
+    ] + state['messages']
+
+    response = llm.invoke(messages)
+
+    return  {'messages': [{'role': 'user', 'content': response.content}]}
 
 graph_builder = StateGraph(State)
 
@@ -117,9 +161,33 @@ graph_builder.add_node('classifier', classify_intent)
 graph_builder.add_node('chat_agent', prompt_llm_chat)
 graph_builder.add_node('rag_agent', prompt_llm_rag)
 graph_builder.add_node('coding_agent', prompt_llm_code)
+graph_builder.add_node('prepare_coding_request', prepare_coding_request)
+graph_builder.add_node('accept_coding', accept_coding)
 
 graph_builder.add_edge(START, 'classifier')
-graph_builder.add_conditional_edges('classifier', lambda state: state['message_intent'], {'chat': 'chat_agent', 'knowledge':'rag_agent', 'code': 'coding_agent'})
+
+graph_builder.add_edge('prepare_coding_request', 'accept_coding')
+
+graph_builder.add_conditional_edges(
+    'classifier',
+    lambda state: state['message_intent'],
+    {
+        'chat': 'chat_agent',
+        'knowledge': 'rag_agent',
+        'code': 'prepare_coding_request'
+    }
+)
+
+graph_builder.add_conditional_edges(
+    'accept_coding',
+    lambda  state: 'end' if state.get('next_node') == 'denied'
+        else state['next_node'],
+    {
+        'coding_agent': 'coding_agent',
+        'end': END,
+        'accept_coding': 'prepare_coding_request'
+    }
+)
 
 graph_builder.add_edge('chat_agent', END)
 graph_builder.add_edge('rag_agent', END)
@@ -127,6 +195,8 @@ graph_builder.add_edge('coding_agent', END)
 
 checkpointer = InMemorySaver()
 graph = graph_builder.compile(checkpointer=checkpointer)
+
+graph.get_graph().draw_mermaid_png(output_file_path='graph.png')
 
 config = {'configurable':{'thread_id':uuid.uuid4()}}
 
@@ -138,6 +208,14 @@ while True:
         },
         config = config
     )
+
+    while '__interrupt__' in result:
+        prompt = result['__interrupt__'][0].value
+        decision = input(f'{prompt}\n ')
+        result = graph.invoke(
+            Command(resume=decision),
+            config = config
+        )
 
     print(result['messages'][-1].content)
 
